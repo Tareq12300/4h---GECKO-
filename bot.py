@@ -37,7 +37,6 @@ DB_FILE = os.environ.get("DB_FILE", "signals_bot.db")
 
 ACCOUNT_BALANCE = float(os.environ.get("ACCOUNT_BALANCE", "1000"))
 RISK_PER_TRADE_PCT = float(os.environ.get("RISK_PER_TRADE_PCT", "1"))
-BTC_TREND_FILTER_ENABLED = os.environ.get("BTC_TREND_FILTER_ENABLED", "true").lower() == "true"
 
 KUCOIN_KLINE_URL = "https://api.kucoin.com/api/v1/market/candles"
 MEXC_KLINE_URL = "https://api.mexc.com/api/v3/klines"
@@ -238,7 +237,7 @@ def calculate_position_size(entry_price: float, stop_loss: float) -> dict:
     }
 
 
-def calculate_ai_ranking_score(score, macd_strength, volume_spike, btc_filter, learning_adjustment, change_1h, change_24h) -> int:
+def calculate_ai_ranking_score(score, macd_strength, volume_spike, learning_adjustment, change_1h, change_24h) -> int:
     ai_score = 50 + score * 4
 
     if macd_strength in ["قوي", "قوي جدًا"]:
@@ -253,12 +252,6 @@ def calculate_ai_ranking_score(score, macd_strength, volume_spike, btc_filter, l
 
     ai_score += learning_adjustment
 
-    if btc_filter.get("status") == "bullish":
-        ai_score += 6
-    elif btc_filter.get("status") == "weak":
-        ai_score -= 8
-    elif btc_filter.get("status") == "bearish":
-        ai_score -= 15
 
     if change_1h > 4:
         ai_score -= 5
@@ -951,112 +944,8 @@ def calculate_sma(values: list, period: int):
     return sum(values[-period:]) / period
 
 
-def get_btc_trend_filter() -> dict:
-    if not BTC_TREND_FILTER_ENABLED:
-        return {
-            "allow": True,
-            "status": "disabled",
-            "note": "فلتر BTC غير مفعّل",
-            "btc_price": 0,
-        }
 
-    try:
-        market_data = get_gate_market_data("BTC")
-        if not market_data:
-            market_data = get_kucoin_market_data("BTC")
-        if not market_data:
-            market_data = get_mexc_market_data("BTC")
-        if not market_data:
-            market_data = get_okx_market_data("BTC")
-
-        if not market_data:
-            return {
-                "allow": True,
-                "status": "unknown",
-                "note": "تعذر قراءة اتجاه BTC",
-                "btc_price": 0,
-            }
-
-        closes = market_data["closes"]
-        btc_price = closes[-1]
-        change_4h = ((closes[-1] - closes[-2]) / closes[-2]) * 100 if len(closes) >= 2 else 0
-
-        sma50 = calculate_sma(closes, 50)
-        sma200 = calculate_sma(closes, 200)
-
-        if sma50 is not None and sma200 is not None:
-            if btc_price > sma50 > sma200 and change_4h > -2:
-                return {
-                    "allow": True,
-                    "status": "bullish",
-                    "note": "BTC داعم للسوق ✅ (SMA50+200)",
-                    "btc_price": btc_price,
-                }
-            if btc_price < sma50 and sma50 < sma200:
-                return {
-                    "allow": False,
-                    "status": "bearish",
-                    "note": "BTC هابط بقوة — تم منع الإشارة ❌",
-                    "btc_price": btc_price,
-                }
-
-        elif sma50 is not None:
-            if btc_price > sma50 and change_4h > -2:
-                return {
-                    "allow": True,
-                    "status": "bullish",
-                    "note": "BTC فوق SMA50 ✅ (وضع مختصر)",
-                    "btc_price": btc_price,
-                }
-            if btc_price < sma50 and change_4h < -1:
-                return {
-                    "allow": False,
-                    "status": "bearish",
-                    "note": "BTC تحت SMA50 وهابط ❌",
-                    "btc_price": btc_price,
-                }
-
-        else:
-            if change_4h <= -3:
-                return {
-                    "allow": False,
-                    "status": "weak",
-                    "note": f"BTC يهبط {change_4h:.1f}% على 4H ⚠️",
-                    "btc_price": btc_price,
-                }
-            return {
-                "allow": True,
-                "status": "neutral",
-                "note": f"BTC محايد (بيانات محدودة) 4H: {change_4h:+.1f}%",
-                "btc_price": btc_price,
-            }
-
-        if change_4h <= -3:
-            return {
-                "allow": False,
-                "status": "weak",
-                "note": f"BTC يهبط بقوة على 4H ({change_4h:.1f}%) ⚠️",
-                "btc_price": btc_price,
-            }
-
-        return {
-            "allow": True,
-            "status": "neutral",
-            "note": f"BTC محايد | 4H: {change_4h:+.1f}%",
-            "btc_price": btc_price,
-        }
-
-    except Exception as e:
-        logging.warning(f"BTC filter error: {e}")
-        return {
-            "allow": True,
-            "status": "unknown",
-            "note": "تعذر قراءة اتجاه BTC",
-            "btc_price": 0,
-        }
-
-
-def analyze_signal(data: dict, btc_filter: dict | None = None):
+def analyze_signal(data: dict):
     price = data["price"]
     change_1h = data["change_1h"]
     change_24h = data["change_24h"]
@@ -1067,15 +956,6 @@ def analyze_signal(data: dict, btc_filter: dict | None = None):
     macd_data = data.get("macd_data")
     volume_spike = data.get("volume_spike")
     current_volume_usd = float(data.get("current_volume_usd", 0))
-    btc_filter = btc_filter or {
-        "allow": True,
-        "status": "unknown",
-        "note": "BTC غير متوفر",
-        "btc_price": 0,
-    }
-
-    if not btc_filter.get("allow", True):
-        return None
 
     if rsi_value is None or macd_data is None:
         return None
@@ -1191,7 +1071,6 @@ def analyze_signal(data: dict, btc_filter: dict | None = None):
         score=score,
         macd_strength=macd_strength["label"],
         volume_spike=volume_spike,
-        btc_filter=btc_filter,
         learning_adjustment=learning["adjustment"],
         change_1h=change_1h,
         change_24h=change_24h,
@@ -1228,7 +1107,6 @@ def analyze_signal(data: dict, btc_filter: dict | None = None):
         "position_pct": position["position_pct"],
         "position_qty": position["quantity"],
         "risk_amount": position["risk_amount"],
-        "btc_trend_note": btc_filter.get("note", "-"),
         "stoch_k": stoch_k,
         "stoch_d": stoch_d,
         "macd_histogram": macd_hist,
@@ -1299,7 +1177,6 @@ def format_signal_message(sig: dict) -> str:
         f"📆 *التغيير 7d:* `{sig['change_7d']:+.2f}%`\n"
         f"💧 *حجم التداول:* `{format_big_number(sig['volume_24h'])} $`\n"
         f"📊 *معدل الفوليوم:* `{sig.get('volume_ratio', 1.0):.2f}x | {format_big_number(sig.get('current_volume_usd', 0))} $`\n"
-        f"₿ *فلتر BTC:* `{sig.get('btc_trend_note', '-')}`\n\n"
         f"🎯 *الأهداف:*\n"
         f"   ├ TP1: `{fp(sig['target1'])} $` `(+2%)`\n"
         f"   ├ TP2: `{fp(sig['target2'])} $` `(+4%)`\n"
@@ -1472,7 +1349,7 @@ async def run_bot():
                 "🔥 Volume Spike + قيمة فوليوم الشمعة الحالية بالدولار\n"
                 f"💧 أقل فوليوم للشمعة الحالية: *{format_big_number(MIN_CURRENT_CANDLE_VOLUME_USD)}$*\n"
                 "🤖 تعلم ذاتي من نتائج الإشارات السابقة\n"
-                "🏆 AI Ranking + BTC Trend Filter\n"
+                "🏆 AI Ranking + Self-Learning\n"
                 "🗄️ SQLite Database + Win Rate اليوم\n"
                 "📌 Auto Position Sizing\n"
                 f"🧠 أقل ثقة للإرسال: *{MIN_CONFIDENCE}%*\n"
@@ -1497,8 +1374,6 @@ async def run_bot():
         print("=" * 55)
         print(f"🔍 [{now.strftime('%H:%M:%S')}] جلب أسواق USDT من المنصات")
 
-        btc_filter = get_btc_trend_filter()
-        print(f"₿ BTC Filter: {btc_filter.get('note')}")
 
         coins = get_markets_from_exchanges()
         tracker.scans += 1
@@ -1564,7 +1439,7 @@ async def run_bot():
                 await asyncio.sleep(0.2)
                 continue
 
-            sig = analyze_signal(coin, btc_filter)
+            sig = analyze_signal(coin)
 
             if sig:
                 await send_signal(bot, sig)
