@@ -45,6 +45,11 @@ MAX_24H_CHANGE = float(os.environ.get("MAX_24H_CHANGE", "15"))
 MIN_VOLUME_24H = float(os.environ.get("MIN_VOLUME_24H", "3000000"))
 MIN_CURRENT_CANDLE_VOLUME_USD = float(os.environ.get("MIN_CURRENT_CANDLE_VOLUME_USD", "200000"))
 
+# إعدادات معدل الفوليوم مقارنة بمتوسط الشموع السابقة
+REQUIRE_VOLUME_RATIO = os.environ.get("REQUIRE_VOLUME_RATIO", "true").lower() == "true"
+MIN_VOLUME_RATIO = float(os.environ.get("MIN_VOLUME_RATIO", "2.0"))
+VOLUME_AVERAGE_PERIOD = int(os.environ.get("VOLUME_AVERAGE_PERIOD", "20"))
+
 HISTORY_FILE = os.environ.get("HISTORY_FILE", "signals_history.json")
 DB_FILE = os.environ.get("DB_FILE", "signals_bot.db")
 
@@ -951,33 +956,44 @@ def calculate_macd(prices: list):
 
 def detect_volume_spike(volumes: list, price: float) -> dict:
     """
-    يحسب Volume Ratio وقيمة فوليوم الشمعة الحالية بالدولار.
+    يحسب معدل حجم الشمعة الحالية مقارنة بمتوسط عدد قابل للتعديل
+    من الشموع السابقة، بالإضافة إلى قيمة الفوليوم الحالية والمتوسطة بالدولار.
     """
-    if len(volumes) < 12:
+    required_length = VOLUME_AVERAGE_PERIOD + 1
+
+    if VOLUME_AVERAGE_PERIOD <= 0 or len(volumes) < required_length:
         return {
             "spike": False,
-            "ratio": 1.0,
-            "current_volume_usd": 0,
+            "ratio": 0.0,
+            "current_volume_usd": 0.0,
+            "average_volume_usd": 0.0,
+            "enough_data": False,
         }
 
-    recent = volumes[-1]
-    avg = sum(volumes[-11:-1]) / 10
+    current_volume = float(volumes[-1])
+    previous_volumes = volumes[-required_length:-1]
+    average_volume = sum(previous_volumes) / VOLUME_AVERAGE_PERIOD
 
-    current_volume_usd = recent * price
+    current_volume_usd = current_volume * price
+    average_volume_usd = average_volume * price
 
-    if avg == 0:
+    if average_volume <= 0:
         return {
             "spike": False,
-            "ratio": 1.0,
+            "ratio": 0.0,
             "current_volume_usd": current_volume_usd,
+            "average_volume_usd": average_volume_usd,
+            "enough_data": True,
         }
 
-    ratio = recent / avg
+    ratio = current_volume / average_volume
 
     return {
-        "spike": ratio > 1.8,
+        "spike": ratio >= MIN_VOLUME_RATIO,
         "ratio": round(ratio, 2),
         "current_volume_usd": current_volume_usd,
+        "average_volume_usd": average_volume_usd,
+        "enough_data": True,
     }
 
 
@@ -1021,6 +1037,8 @@ def analyze_signal(data: dict):
     macd_data = data.get("macd_data")
     volume_spike = data.get("volume_spike")
     current_volume_usd = float(data.get("current_volume_usd", 0))
+    volume_ratio = float(data.get("volume_ratio", 0))
+    volume_enough_data = bool(data.get("volume_enough_data", False))
 
     if rsi_value is None or macd_data is None:
         return None
@@ -1045,6 +1063,12 @@ def analyze_signal(data: dict):
 
     if current_volume_usd < MIN_CURRENT_CANDLE_VOLUME_USD:
         return None
+
+    # عند تفعيل الشرط، لا تُرسل الإشارة إلا إذا كان فوليوم الشمعة الحالية
+    # يساوي أو يتجاوز النسبة المطلوبة من متوسط الشموع السابقة.
+    if REQUIRE_VOLUME_RATIO:
+        if not volume_enough_data or volume_ratio < MIN_VOLUME_RATIO:
+            return None
 
     score = 0
     reasons = []
@@ -1242,8 +1266,9 @@ def analyze_signal(data: dict):
         "change_24h": change_24h,
         "change_7d": change_7d,
         "volume_24h": volume_24h,
-        "volume_ratio": data.get("volume_ratio", 1.0),
+        "volume_ratio": data.get("volume_ratio", 0.0),
         "current_volume_usd": data.get("current_volume_usd", 0),
+        "average_volume_usd": data.get("average_volume_usd", 0),
         "learning_note": learning["note"],
         "learning_adjustment": learning["adjustment"],
         "reasons": reasons[:9],
@@ -1299,7 +1324,9 @@ def format_signal_message(sig: dict) -> str:
         f"📊 *التغيير 24h:* `{sig['change_24h']:+.2f}%`\n"
         f"📆 *التغيير 7d:* `{sig['change_7d']:+.2f}%`\n"
         f"💧 *حجم التداول:* `{format_big_number(sig['volume_24h'])} $`\n"
-        f"📊 *معدل الفوليوم:* `{sig.get('volume_ratio', 1.0):.2f}x | {format_big_number(sig.get('current_volume_usd', 0))} $`\n"
+        f"📊 *معدل الفوليوم:* `{sig.get('volume_ratio', 0.0):.2f}x`\n"
+        f"💧 *فوليوم الشمعة:* `{format_big_number(sig.get('current_volume_usd', 0))} $`\n"
+        f"📏 *متوسط آخر {VOLUME_AVERAGE_PERIOD} شمعة:* `{format_big_number(sig.get('average_volume_usd', 0))} $`\n"
         f"🎯 *الأهداف:*\n"
         f"   ├ TP1: `{fp(sig['target1'])} $` `(+2%)`\n"
         f"   ├ TP2: `{fp(sig['target2'])} $` `(+4%)`\n"
@@ -1576,6 +1603,8 @@ async def run_bot():
             coin["volume_spike"] = volume_spike
             coin["volume_ratio"] = volume_data["ratio"]
             coin["current_volume_usd"] = volume_data.get("current_volume_usd", 0)
+            coin["average_volume_usd"] = volume_data.get("average_volume_usd", 0)
+            coin["volume_enough_data"] = volume_data.get("enough_data", False)
 
             sig = analyze_signal(coin)
 
