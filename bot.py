@@ -27,6 +27,12 @@ RSI_TIMEFRAME = os.environ.get("RSI_TIMEFRAME", "240")
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
 MAX_RSI_BUY = float(os.environ.get("MAX_RSI_BUY", "20"))
 
+# إعدادات التنبيه المبكر
+ALLOW_EARLY_STOCH = os.environ.get("ALLOW_EARLY_STOCH", "true").lower() == "true"
+MAX_STOCH_GAP = float(os.environ.get("MAX_STOCH_GAP", "8"))
+ALLOW_NEGATIVE_MACD = os.environ.get("ALLOW_NEGATIVE_MACD", "true").lower() == "true"
+REQUIRE_MACD_RISING = os.environ.get("REQUIRE_MACD_RISING", "true").lower() == "true"
+
 MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "90"))
 MAX_24H_CHANGE = float(os.environ.get("MAX_24H_CHANGE", "15"))
 MIN_VOLUME_24H = float(os.environ.get("MIN_VOLUME_24H", "3000000"))
@@ -815,6 +821,8 @@ def calculate_stoch_rsi(closes, rsi_period=14, stoch_period=14, smooth_k=3, smoo
     return {
         "k": round(k_values[-1], 2),
         "d": round(d_values[-1], 2),
+        "k_prev": round(k_values[-2], 2) if len(k_values) >= 2 else round(k_values[-1], 2),
+        "d_prev": round(d_values[-2], 2) if len(d_values) >= 2 else round(d_values[-1], 2),
     }
 
 
@@ -962,10 +970,13 @@ def analyze_signal(data: dict):
 
     stoch_k = rsi_value.get("k")
     stoch_d = rsi_value.get("d")
+    stoch_k_prev = rsi_value.get("k_prev", stoch_k)
+    stoch_d_prev = rsi_value.get("d_prev", stoch_d)
 
     if stoch_k is None or stoch_d is None:
         return None
 
+    # يجب أن يكون المؤشر داخل منطقة التشبع المحددة.
     if stoch_k >= MAX_RSI_BUY or stoch_d >= MAX_RSI_BUY:
         return None
 
@@ -984,52 +995,85 @@ def analyze_signal(data: dict):
     if stoch_k < 10 and stoch_d < 10:
         score += 4
         reasons.append(f"Stoch RSI K=`{stoch_k}` D=`{stoch_d}` — تشبع بيع قوي جدًا 🔥")
-    elif stoch_k < 15:
+    elif stoch_k < 15 and stoch_d < 15:
         score += 3
         reasons.append(f"Stoch RSI K=`{stoch_k}` D=`{stoch_d}` — تشبع بيع قوي 🔥")
     else:
         score += 2
         reasons.append(f"Stoch RSI K=`{stoch_k}` D=`{stoch_d}` — منطقة تشبع بيع")
 
-    if stoch_k <= stoch_d:
+    # نوع إشارة Stoch RSI:
+    # 1) مؤكدة: K أعلى من D.
+    # 2) مبكرة: K ما زال أسفل D، لكنه بدأ يصعد والفارق بينهما صغير.
+    stoch_crossed = stoch_k > stoch_d
+    stoch_turning_up = stoch_k > stoch_k_prev
+    stoch_gap = max(stoch_d - stoch_k, 0)
+    early_stoch = (
+        ALLOW_EARLY_STOCH
+        and not stoch_crossed
+        and stoch_turning_up
+        and stoch_gap <= MAX_STOCH_GAP
+    )
+
+    if not stoch_crossed and not early_stoch:
         return None
 
-    score += 2
-    reasons.append("Stoch RSI: K تجاوز D — إشارة ارتداد 📈")
+    if stoch_crossed:
+        score += 2
+        reasons.append("Stoch RSI: K أعلى من D — تقاطع شراء 📈")
+        signal_stage = "CONFIRMED"
+    else:
+        score += 1
+        reasons.append(
+            f"Stoch RSI بدأ ينعكس صعودًا قبل التقاطع — الفارق `{stoch_gap:.2f}`"
+        )
+        signal_stage = "EARLY"
 
     macd_hist = macd_data["histogram"]
+    macd_hist_prev = macd_data.get("histogram_prev", macd_hist)
     macd_direction = macd_data.get("direction", "rising")
     macd_color = macd_data.get("color", "")
     macd_strength = classify_macd_histogram(macd_hist, price, macd_direction, macd_color)
 
-    if macd_hist <= 0:
+    # لا نطلب أن يكون MACD موجبًا وقويًا جدًا؛ يكفي أن يتحسن.
+    macd_improving = macd_hist > macd_hist_prev
+
+    if REQUIRE_MACD_RISING and not macd_improving:
         return None
 
-    if macd_direction != "rising":
+    if macd_hist < 0 and not ALLOW_NEGATIVE_MACD:
         return None
 
-    if macd_strength["label"] != "قوي جدًا":
-        return None
-
-    if not macd_data.get("switched_to_rising"):
-        return None
-
-    score += macd_strength["score"]
-    reasons.append(f"MACD Histogram إيجابي متصاعد — {macd_strength['label']} {macd_strength['emoji']}")
-
-    score += 1
-    reasons.append("MACD تحول للإيجابية للتو 🚀")
+    if macd_hist > 0:
+        score += max(macd_strength["score"], 1)
+        reasons.append(
+            f"MACD Histogram إيجابي ومتحسن — {macd_strength['label']} {macd_strength['emoji']}"
+        )
+        if macd_data.get("switched_to_rising"):
+            score += 1
+            reasons.append("MACD تحول من السالب إلى الموجب للتو 🚀")
+    else:
+        # MACD سلبي لكنه يتحرك باتجاه الصفر، وهذه هي حالة التنبيه المبكر.
+        score += 1
+        reasons.append(
+            f"MACD ما زال سلبيًا لكنه يتحسن باتجاه الصفر: `{macd_hist_prev}` → `{macd_hist}`"
+        )
+        signal_stage = "EARLY"
 
     if volume_spike:
         score += 2
         reasons.append("Volume Spike قوي 🔥")
+    else:
+        reasons.append(
+            f"الفوليوم مستوفٍ للحد الأدنى دون Spike — `{data.get('volume_ratio', 1.0):.2f}x`"
+        )
 
     if -1.5 <= change_1h <= 2:
         score += 1
-        reasons.append("الحركة الساعية غير متضخمة")
+        reasons.append("حركة آخر شمعة غير متضخمة")
     elif change_1h < -2:
         score += 1
-        reasons.append("هبوط قصير قد يعطي ارتداد")
+        reasons.append("هبوط آخر شمعة قد يسبق ارتدادًا")
 
     if -10 <= change_24h <= 4:
         score += 2
@@ -1051,12 +1095,15 @@ def analyze_signal(data: dict):
     if score < 3:
         return None
 
-    confidence = min(55 + score * 5, 90)
+    confidence = min(50 + score * 5, 90)
+
+    if signal_stage == "EARLY":
+        confidence = min(confidence, 82)
 
     if not volume_spike:
         confidence = min(confidence, 78)
 
-    if volume_spike and macd_strength["label"] == "قوي جدًا":
+    if volume_spike and macd_hist > 0:
         confidence = min(confidence + 5, 95)
 
     learning = get_learning_adjustment({
@@ -1065,7 +1112,7 @@ def analyze_signal(data: dict):
     })
 
     confidence = confidence + learning["adjustment"]
-    confidence = max(50, min(confidence, 95))
+    confidence = max(45, min(confidence, 95))
 
     ai_score = calculate_ai_ranking_score(
         score=score,
@@ -1094,6 +1141,8 @@ def analyze_signal(data: dict):
         "name": data["name"],
         "exchange": data.get("exchange", "غير معروف"),
         "type": "BUY",
+        "signal_stage": signal_stage,
+        "signal_label": "تنبيه ارتداد مبكر" if signal_stage == "EARLY" else "إشارة شراء مؤكدة",
         "price": price,
         "target1": round(target1, 8),
         "target2": round(target2, 8),
@@ -1109,8 +1158,10 @@ def analyze_signal(data: dict):
         "risk_amount": position["risk_amount"],
         "stoch_k": stoch_k,
         "stoch_d": stoch_d,
+        "stoch_k_prev": stoch_k_prev,
+        "stoch_d_prev": stoch_d_prev,
         "macd_histogram": macd_hist,
-        "macd_histogram_prev": macd_data.get("histogram_prev"),
+        "macd_histogram_prev": macd_hist_prev,
         "macd_direction": macd_direction,
         "macd_color": macd_color,
         "macd_strength": macd_strength["label"],
@@ -1126,7 +1177,7 @@ def analyze_signal(data: dict):
         "current_volume_usd": data.get("current_volume_usd", 0),
         "learning_note": learning["note"],
         "learning_adjustment": learning["adjustment"],
-        "reasons": reasons[:8],
+        "reasons": reasons[:9],
     }
 
 
@@ -1163,10 +1214,11 @@ def format_signal_message(sig: dict) -> str:
     dir_text = "⬆️ متصاعد" if sig.get("macd_direction") == "rising" else "⬇️ متراجع"
 
     return (
-        f"🟢 *إشارة شراء 4H | {sig['symbol']}/USDT*\n"
+        f"🟢 *{sig.get('signal_label', 'إشارة شراء')} 4H | {sig['symbol']}/USDT*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⏰ *الوقت:* `{ts}`\n"
         f"🏦 *المنصة:* `{sig.get('exchange', 'غير معروف')}`\n"
+        f"🚦 *نوع التنبيه:* `{sig.get('signal_label', 'إشارة شراء')}`\n"
         f"💰 *سعر الدخول:* `{fp(sig['price'])} $`\n\n"
         f"📉 *Stoch RSI K:* `{sig.get('stoch_k')}`\n"
         f"📉 *Stoch RSI D:* `{sig.get('stoch_d')}`\n"
@@ -1345,7 +1397,8 @@ async def run_bot():
                 "🤖 *بوت إشارات 4H شغّال الآن!*\n\n"
                 f"📊 يراقب حتى *{MAX_MARKETS} سوق USDT* من Gate.io وKuCoin وMEXC وOKX\n"
                 f"📉 Stochastic RSI على فريم *4H* — K و D أقل من *{MAX_RSI_BUY}*\n"
-                "📊 MACD Hist — *قوي جدًا ومتصاعد فقط* 🔥\n"
+                "📊 MACD Hist — يسمح بالتنبيه المبكر عندما يكون سلبيًا لكنه يتحسن\n"
+                "📉 تنبيه مبكر عند انعكاس Stoch RSI قبل التقاطع بفارق محدود\n"
                 "🔥 Volume Spike + قيمة فوليوم الشمعة الحالية بالدولار\n"
                 f"💧 أقل فوليوم للشمعة الحالية: *{format_big_number(MIN_CURRENT_CANDLE_VOLUME_USD)}$*\n"
                 "🤖 تعلم ذاتي من نتائج الإشارات السابقة\n"
