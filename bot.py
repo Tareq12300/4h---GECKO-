@@ -48,7 +48,8 @@ MIN_CURRENT_CANDLE_VOLUME_USD = float(os.environ.get("MIN_CURRENT_CANDLE_VOLUME_
 # إعدادات معدل الفوليوم مقارنة بمتوسط الشموع السابقة
 REQUIRE_VOLUME_RATIO = os.environ.get("REQUIRE_VOLUME_RATIO", "true").lower() == "true"
 MIN_VOLUME_RATIO = float(os.environ.get("MIN_VOLUME_RATIO", "2.0"))
-VOLUME_AVERAGE_PERIOD = int(os.environ.get("VOLUME_AVERAGE_PERIOD", "20"))
+VOLUME_AVERAGE_PERIOD = int(os.environ.get("VOLUME_AVERAGE_PERIOD", "100"))
+VOLUME_AVERAGE_METHOD = os.environ.get("VOLUME_AVERAGE_METHOD", "sma").strip().lower()
 
 HISTORY_FILE = os.environ.get("HISTORY_FILE", "signals_history.json")
 DB_FILE = os.environ.get("DB_FILE", "signals_bot.db")
@@ -971,8 +972,17 @@ def detect_volume_spike(volumes: list, price: float) -> dict:
         }
 
     current_volume = float(volumes[-1])
-    previous_volumes = volumes[-required_length:-1]
-    average_volume = sum(previous_volumes) / VOLUME_AVERAGE_PERIOD
+    previous_volumes = [float(v) for v in volumes[-required_length:-1]]
+
+    # TradingView Volume MA is normally a simple moving average (SMA).
+    # EMA remains available through VOLUME_AVERAGE_METHOD=ema.
+    if VOLUME_AVERAGE_METHOD == "ema":
+        alpha = 2 / (VOLUME_AVERAGE_PERIOD + 1)
+        average_volume = previous_volumes[0]
+        for volume in previous_volumes[1:]:
+            average_volume = (volume * alpha) + (average_volume * (1 - alpha))
+    else:
+        average_volume = sum(previous_volumes) / VOLUME_AVERAGE_PERIOD
 
     current_volume_usd = current_volume * price
     average_volume_usd = average_volume * price
@@ -1326,7 +1336,7 @@ def format_signal_message(sig: dict) -> str:
         f"💧 *حجم التداول:* `{format_big_number(sig['volume_24h'])} $`\n"
         f"📊 *معدل الفوليوم:* `{sig.get('volume_ratio', 0.0):.2f}x`\n"
         f"💧 *فوليوم الشمعة:* `{format_big_number(sig.get('current_volume_usd', 0))} $`\n"
-        f"📏 *متوسط آخر {VOLUME_AVERAGE_PERIOD} شمعة:* `{format_big_number(sig.get('average_volume_usd', 0))} $`\n"
+        f"📏 *متوسط آخر {VOLUME_AVERAGE_PERIOD} شمعة ({VOLUME_AVERAGE_METHOD.upper()}):* `{format_big_number(sig.get('average_volume_usd', 0))} $`\n"
         f"🎯 *الأهداف:*\n"
         f"   ├ TP1: `{fp(sig['target1'])} $` `(+2%)`\n"
         f"   ├ TP2: `{fp(sig['target2'])} $` `(+4%)`\n"
