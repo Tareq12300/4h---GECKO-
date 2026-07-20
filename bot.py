@@ -3,7 +3,7 @@
 
 الهيكل:
 1) جلب حتى 10,000 عملة من CoinGecko.
-2) مطابقة الرموز مع Gate.io وKuCoin وMEXC وOKX.
+2) مطابقة الرموز مع Gate.io وKuCoin وMEXC وBinance وBitMart.
 3) اختيار المنصة الأعلى سيولة لكل زوج USDT.
 4) جلب شموع 4H من المنصة المختارة.
 5) حساب Stoch RSI وMACD ونسبة فوليوم الشمعة.
@@ -48,14 +48,14 @@ TIMEFRAME = os.environ.get("TIMEFRAME", "4h").strip().lower()
 EXCHANGES = [
     item.strip().lower()
     for item in os.environ.get(
-        "EXCHANGES", "gateio,kucoin,mexc,binance"
+        "EXCHANGES", "gateio,kucoin,mexc,binance,bitmart"
     ).split(",")
     if item.strip()
 ]
 EXCHANGE_PRIORITY = [
     item.strip().lower()
     for item in os.environ.get(
-        "EXCHANGE_PRIORITY", "gateio,kucoin,mexc,binance"
+        "EXCHANGE_PRIORITY", "gateio,kucoin,mexc,binance,bitmart"
     ).split(",")
     if item.strip()
 ]
@@ -164,7 +164,6 @@ REQUIRE_STOCH_RISING = (
 )
 
 
-
 SIGNAL_COOLDOWN_HOURS = float(os.environ.get("SIGNAL_COOLDOWN_HOURS", "4"))
 
 MAX_24H_CHANGE = float(os.environ.get("MAX_24H_CHANGE", "15"))
@@ -249,10 +248,10 @@ BINANCE_TIMEFRAMES = {
     "6h": "6h", "8h": "8h", "12h": "12h", "1d": "1d", "1w": "1w",
 }
 
-OKX_TIMEFRAMES = {
-    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
-    "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H",
-    "6h": "6H", "12h": "12H", "1d": "1D", "1w": "1W",
+BITMART_TIMEFRAMES = {
+    "1m": "1", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "2h": "120", "4h": "240",
+    "1d": "1440", "1w": "10080",
 }
 
 
@@ -263,8 +262,9 @@ def normalize_exchange_name(name: str) -> str:
         "gateio": "gateio",
         "kucoin": "kucoin",
         "mexc": "mexc",
-        "okx": "okx",
         "binance": "binance",
+        "bitmart": "bitmart",
+        "bitmart.com": "bitmart",
     }
     return aliases.get(name.strip().lower(), name.strip().lower())
 
@@ -291,8 +291,8 @@ def exchange_timeframe(exchange: str) -> Optional[str]:
         "gateio": GATE_TIMEFRAMES,
         "kucoin": KUCOIN_TIMEFRAMES,
         "mexc": MEXC_TIMEFRAMES,
-        "okx": OKX_TIMEFRAMES,
         "binance": BINANCE_TIMEFRAMES,
+        "bitmart": BITMART_TIMEFRAMES,
     }
     return maps.get(exchange, {}).get(TIMEFRAME)
 
@@ -303,15 +303,15 @@ def exchange_timeframe(exchange: str) -> Optional[str]:
 
 KUCOIN_KLINE_URL = "https://api.kucoin.com/api/v1/market/candles"
 MEXC_KLINE_URL = "https://api.mexc.com/api/v3/klines"
-OKX_KLINE_URL = "https://www.okx.com/api/v5/market/candles"
 BINANCE_KLINE_URL = "https://api.binance.com/api/v3/klines"
+BITMART_KLINE_URL = "https://api-cloud.bitmart.com/spot/quotation/v3/lite-klines"
 GATE_KLINE_URL = "https://api.gateio.ws/api/v4/spot/candlesticks"
 
 GATE_TICKERS_URL = "https://api.gateio.ws/api/v4/spot/tickers"
 KUCOIN_TICKERS_URL = "https://api.kucoin.com/api/v1/market/allTickers"
 MEXC_TICKERS_URL = "https://api.mexc.com/api/v3/ticker/24hr"
-OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
 BINANCE_TICKERS_URL = "https://api.binance.com/api/v3/ticker/24hr"
+BITMART_TICKERS_URL = "https://api-cloud.bitmart.com/spot/quotation/v3/tickers"
 
 
 # =========================================================
@@ -1215,55 +1215,46 @@ def get_binance_markets() -> list:
         return []
 
 
-def get_okx_markets() -> list:
+def get_bitmart_markets() -> list:
     try:
-        payload = request_json(
-            OKX_TICKERS_URL,
-            params={"instType": "SPOT"},
-        )
+        payload = request_json(BITMART_TICKERS_URL)
+        if safe_float(payload.get("code")) != 1000:
+            return []
+
+        rows = payload.get("data", [])
         markets = []
 
-        for item in payload.get("data", []):
-            pair = item.get("instId", "")
+        for item in rows:
+            if not isinstance(item, list) or len(item) < 8:
+                continue
 
-            if not pair.endswith("-USDT"):
+            pair = str(item[0])
+            if not pair.endswith("_USDT"):
                 continue
 
             symbol = pair[:-5].upper()
-
             if not valid_usdt_symbol(symbol):
                 continue
 
-            last = safe_float(item.get("last"))
-            open_24h = safe_float(
-                item.get("open24h")
-            )
-            volume_24h = safe_float(
-                item.get("volCcy24h")
-            )
-            change_24h = (
-                (last - open_24h) / open_24h * 100
-                if open_24h > 0
-                else 0.0
-            )
+            last = safe_float(item[1])
+            volume_24h = safe_float(item[3])
+            change_24h = safe_float(item[7]) * 100
 
             if last <= 0 or volume_24h <= 0:
                 continue
 
-            markets.append(
-                {
-                    "symbol": symbol,
-                    "exchange": "OKX",
-                    "price": last,
-                    "exchange_volume_24h": volume_24h,
-                    "exchange_change_24h": change_24h,
-                }
-            )
+            markets.append({
+                "symbol": symbol,
+                "exchange": "BitMart",
+                "price": last,
+                "exchange_volume_24h": volume_24h,
+                "exchange_change_24h": change_24h,
+            })
 
         return markets
 
     except Exception as exc:
-        logging.error("OKX tickers: %s", exc)
+        logging.error("BitMart tickers: %s", exc)
         return []
 
 
@@ -1272,8 +1263,8 @@ def build_exchange_symbol_maps() -> Dict[str, Dict[str, dict]]:
         "gateio": ("Gate.io", get_gate_markets),
         "kucoin": ("KuCoin", get_kucoin_markets),
         "mexc": ("MEXC", get_mexc_markets),
-        "okx": ("OKX", get_okx_markets),
         "binance": ("Binance", get_binance_markets),
+        "bitmart": ("BitMart", get_bitmart_markets),
     }
 
     sources = {}
@@ -1345,7 +1336,8 @@ def get_markets_from_coingecko_and_exchanges() -> list:
                 "gateio": "Gate.io",
                 "kucoin": "KuCoin",
                 "mexc": "MEXC",
-                "okx": "OKX",
+                "binance": "Binance",
+                "bitmart": "BitMart",
             }
             selected = None
 
@@ -1603,49 +1595,33 @@ def get_binance_market_data(
         return None
 
 
-def get_okx_market_data(
+def get_bitmart_market_data(
     symbol: str,
 ) -> Optional[dict]:
     try:
         payload = request_json(
-            OKX_KLINE_URL,
+            BITMART_KLINE_URL,
             params={
-                "instId": f"{symbol}-USDT",
-                "bar": exchange_timeframe("okx"),
-                "limit": str(CANDLE_LIMIT),
+                "symbol": f"{symbol}_USDT",
+                "step": exchange_timeframe("bitmart"),
+                "limit": min(CANDLE_LIMIT, 200),
             },
             timeout=15,
         )
 
-        if payload.get("code") != "0":
+        if safe_float(payload.get("code")) != 1000:
             return None
 
         rows = payload.get("data", [])
-
-        if not rows:
+        if not isinstance(rows, list) or not rows:
             return None
 
-        rows = list(reversed(rows))
-
-        closes = [
-            safe_float(row[4])
-            for row in rows
-        ]
-        base_volumes = [
-            safe_float(row[5])
-            for row in rows
-        ]
+        rows = sorted(rows, key=lambda row: int(row[0]))
+        closes = [safe_float(row[4]) for row in rows]
+        base_volumes = [safe_float(row[5]) for row in rows]
         quote_volumes = [
-            (
-                safe_float(row[7])
-                if len(row) > 7
-                else base * close
-            )
-            for row, base, close in zip(
-                rows,
-                base_volumes,
-                closes,
-            )
+            safe_float(row[6]) if len(row) > 6 else base * close
+            for row, base, close in zip(rows, base_volumes, closes)
         ]
 
         return {
@@ -1655,11 +1631,7 @@ def get_okx_market_data(
         }
 
     except Exception as exc:
-        logging.info(
-            "OKX candles %s: %s",
-            symbol,
-            exc,
-        )
+        logging.info("BitMart candles %s: %s", symbol, exc)
         return None
 
 
@@ -1671,8 +1643,8 @@ def get_market_data_for_exchange(
         "Gate.io": "gateio",
         "KuCoin": "kucoin",
         "MEXC": "mexc",
-        "OKX": "okx",
         "Binance": "binance",
+        "BitMart": "bitmart",
     }.get(exchange)
 
     if not exchange_key or exchange_timeframe(exchange_key) is None:
@@ -1687,11 +1659,11 @@ def get_market_data_for_exchange(
     if exchange == "MEXC":
         return get_mexc_market_data(symbol)
 
-    if exchange == "OKX":
-        return get_okx_market_data(symbol)
-
     if exchange == "Binance":
         return get_binance_market_data(symbol)
+
+    if exchange == "BitMart":
+        return get_bitmart_market_data(symbol)
 
     return None
 
